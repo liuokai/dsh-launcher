@@ -28,7 +28,7 @@
 ### 方式二：从源码构建
 
 ```bash
-git clone <你的仓库地址> && cd DSH
+git clone https://github.com/liuokai/dsh-launcher.git && cd dsh-launcher
 ./build.sh        # 编译并生成 build/DSH.app（需 Xcode Command Line Tools）
 ./install.sh      # 安装到 /Applications
 open /Applications/DSH.app
