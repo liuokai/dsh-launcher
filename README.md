@@ -30,18 +30,19 @@
 ```bash
 git clone https://github.com/liuokai/dsh-launcher.git && cd dsh-launcher
 ./build.sh        # 编译并生成 build/DSH.app（需 Xcode Command Line Tools）
-./install.sh      # 安装到 /Applications
-open /Applications/DSH.app
+./install.sh      # 一键安装/更新到 /Applications（自动退出旧版、留底废纸篓并重启）
 ```
+
+日常迭代只需 `./build.sh && ./install.sh`；也可以跳过安装，直接运行 `build/DSH.app` 测试。
 
 ## 使用说明
 
 | 功能 | 入口 |
 |---|---|
-| 在系统浏览器打开 | 工具栏「浏览器打开」或 ⌘O |
-| 刷新页面 | ⌘R |
-| 重启服务 | 工具栏「重启服务」或 ⇧⌘R |
-| 查看服务日志 | 工具栏「日志」或底部终端图标 |
+| 在系统浏览器打开 | 右上角工具栏「浏览器打开」或 ⌘O |
+| 刷新页面 | 右上角工具栏「刷新」或 ⌘R |
+| 重启服务 | 右上角工具栏「重启服务」或 ⇧⌘R |
+| 显示/隐藏服务日志 | 右下角「日志」按钮或 ⌘L |
 | 修改端口 | 菜单「服务器 → 端口设置…」 |
 | 退出时保留服务 | 菜单「服务器 → 退出时保留服务进程」 |
 | 登录时自动启动 | 菜单「服务器 → 登录时自动启动」（需 App 位于 /Applications） |

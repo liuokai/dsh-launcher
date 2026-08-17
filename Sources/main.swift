@@ -267,8 +267,6 @@ extension NSToolbarItem.Identifier {
     static let reloadID = NSToolbarItem.Identifier("dsh.reload")
     static let browserID = NSToolbarItem.Identifier("dsh.browser")
     static let restartID = NSToolbarItem.Identifier("dsh.restart")
-    static let logID = NSToolbarItem.Identifier("dsh.log")
-    static let urlID = NSToolbarItem.Identifier("dsh.url")
 }
 
 // MARK: - 页面配色（取自 DSH 前端 CSS 设计变量，深色主题）
@@ -277,6 +275,8 @@ extension NSToolbarItem.Identifier {
 let guiBgColor = NSColor(calibratedRed: 21/255.0, green: 21/255.0, blue: 23/255.0, alpha: 1)
 /// 页面上浮层级色 `--dsw-static-neutral-bluish-900: rgb(27,27,28)`
 let guiLayerColor = NSColor(calibratedRed: 27/255.0, green: 27/255.0, blue: 28/255.0, alpha: 1)
+/// 日志抽屉展开时的高度（收起时为 0）
+let logDockHeight: CGFloat = 170
 
 /// 将图片重着色（保留 alpha 形状，替换颜色）
 func tinted(_ img: NSImage, with color: NSColor) -> NSImage {
@@ -308,6 +308,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var spinner: NSProgressIndicator!
     private var messageLabel: NSTextField!
     private var detailLabel: NSTextField!
+    private var logPanel: NSView!
+    private var logHeight: NSLayoutConstraint!
     private var logScroll: NSScrollView!
     private var logView: NSTextView!
     private var whaleView: NSImageView!
@@ -316,6 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var statusDot: NSImageView!
     private var statusLabel: NSTextField!
     private var statusBar: NSView!
+    private var logButton: NSButton!
 
     private var state: State = .starting
     private var starting = false
@@ -396,6 +399,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         reloadPageItem?.target = self
         restartServerItem = serverMenu.addItem(withTitle: "重新启动服务", action: #selector(restartServer), keyEquivalent: "R")
         restartServerItem?.target = self
+        serverMenu.addItem(withTitle: "显示/隐藏日志", action: #selector(toggleLog), keyEquivalent: "l")
+            .target = self
         serverMenu.addItem(.separator())
         keepOnQuitItem = serverMenu.addItem(withTitle: "退出时保留服务进程", action: #selector(toggleKeepOnQuit), keyEquivalent: "")
         keepOnQuitItem?.target = self
@@ -479,11 +484,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusBar.addSubview(statusLabel)
 
-        // 图标化日志按钮
+        // 日志按钮：显示/隐藏日志抽屉的唯一入口（图标+文字、圆角边框，展开时高亮）
         let logBtn = NSButton()
+        logBtn.title = "日志"
         logBtn.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "日志")
-        logBtn.imagePosition = .imageOnly
-        logBtn.bezelStyle = .inline
+        logBtn.imagePosition = .imageLeading
+        logBtn.bezelStyle = .texturedRounded
         logBtn.controlSize = .small
         logBtn.contentTintColor = .secondaryLabelColor
         logBtn.toolTip = "显示或隐藏日志 (⌘L)"
@@ -491,6 +497,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         logBtn.action = #selector(toggleLog)
         logBtn.translatesAutoresizingMaskIntoConstraints = false
         statusBar.addSubview(logBtn)
+        logButton = logBtn
+
+        // 日志抽屉须在布局激活前创建（webView 底边锚定在抽屉顶边）
+        buildLogPanel()
 
         panelTop = panel.topAnchor.constraint(equalTo: content.topAnchor, constant: 8)
         panelLeading = panel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10)
@@ -503,7 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             webView.topAnchor.constraint(equalTo: panel.topAnchor),
             webView.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: logPanel.topAnchor),
 
             statusBar.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
@@ -524,9 +534,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: logBtn.leadingAnchor, constant: -12),
 
-            logBtn.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -8),
+            logBtn.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -10),
             logBtn.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
-            logBtn.widthAnchor.constraint(equalToConstant: 26),
         ])
 
         buildOverlay()
@@ -614,48 +623,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         btnRow.translatesAutoresizingMaskIntoConstraints = false
         ov.addSubview(btnRow)
 
-        // 圆角日志卡片
-        let logCard = NSView()
-        logCard.wantsLayer = true
-        logCard.layer?.cornerRadius = 8
-        logCard.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
-        logCard.layer?.borderWidth = 1
-        logCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
-        logCard.translatesAutoresizingMaskIntoConstraints = false
-        ov.addSubview(logCard)
-
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
-        scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        logCard.addSubview(scroll)
-        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 160))
-        tv.isEditable = false
-        tv.isSelectable = true
-        tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        tv.textColor = .secondaryLabelColor
-        tv.backgroundColor = .clear
-        tv.autoresizingMask = [.width]
-        tv.isVerticallyResizable = true
-        tv.isHorizontallyResizable = false
-        tv.textContainer?.widthTracksTextView = true
-        tv.textContainer?.containerSize = NSSize(width: 200, height: CGFloat.greatestFiniteMagnitude)
-        tv.textContainerInset = NSSize(width: 10, height: 8)
-        scroll.documentView = tv
-        logView = tv
-        logScroll = scroll
-
-        let cardTop = logCard.topAnchor.constraint(greaterThanOrEqualTo: btnRow.bottomAnchor, constant: 20)
-        cardTop.priority = NSLayoutConstraint.Priority(999)
-        let cardHeight = logCard.heightAnchor.constraint(equalToConstant: 170)
-        cardHeight.priority = NSLayoutConstraint.Priority(750)
-
         NSLayoutConstraint.activate([
             ov.topAnchor.constraint(equalTo: panel.topAnchor),
             ov.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             ov.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            ov.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            ov.bottomAnchor.constraint(equalTo: logPanel.topAnchor),
 
             whaleView.centerXAnchor.constraint(equalTo: ov.centerXAnchor),
             whaleView.centerYAnchor.constraint(equalTo: ov.centerYAnchor, constant: -64),
@@ -677,18 +649,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
             btnRow.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 16),
             btnRow.centerXAnchor.constraint(equalTo: ov.centerXAnchor),
+        ])
+    }
 
-            cardTop,
-            logCard.leadingAnchor.constraint(equalTo: ov.leadingAnchor, constant: 16),
-            logCard.trailingAnchor.constraint(equalTo: ov.trailingAnchor, constant: -16),
-            logCard.bottomAnchor.constraint(equalTo: ov.bottomAnchor, constant: -16),
-            logCard.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            cardHeight,
+    // MARK: 日志抽屉（底部停靠式）
 
-            scroll.topAnchor.constraint(equalTo: logCard.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: logCard.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: logCard.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: logCard.bottomAnchor),
+    /// 日志面板：停靠在页面底部（网页与状态栏之间），打开时网页区域自动上移让位，
+    /// 与页面内容（含输入框）互不覆盖。高度由 logHeight 约束控制（170 展开 / 0 收起）。
+    private func buildLogPanel() {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.backgroundColor = guiLayerColor.cgColor
+        card.layer?.masksToBounds = true
+        card.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(card)
+        logPanel = card
+
+        // 顶部发丝分隔线（与状态栏同款）
+        let hairline = NSView()
+        hairline.wantsLayer = true
+        hairline.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
+        hairline.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(hairline)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(scroll)
+        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 160))
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.textColor = .secondaryLabelColor
+        tv.backgroundColor = .clear
+        tv.autoresizingMask = [.width]
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: 200, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainerInset = NSSize(width: 10, height: 8)
+        scroll.documentView = tv
+        logView = tv
+        logScroll = scroll
+
+        logHeight = card.heightAnchor.constraint(equalToConstant: logDockHeight)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            card.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            logHeight,
+
+            hairline.topAnchor.constraint(equalTo: card.topAnchor),
+            hairline.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            hairline.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            hairline.heightAnchor.constraint(equalToConstant: 0.5),
+
+            scroll.topAnchor.constraint(equalTo: card.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: card.bottomAnchor),
         ])
     }
 
@@ -699,6 +721,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         starting = true
         state = .starting
         overlay.isHidden = false
+        logShown = true
+        logPanel.isHidden = false
+        logHeight.constant = logDockHeight
+        refreshLogButton()
         spinner.startAnimation(nil)
         messageLabel.stringValue = "正在启动 DeepSeek Harness 服务…"
         detailLabel.stringValue = "正在检查 http://127.0.0.1:\(server.port) …"
@@ -768,6 +794,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         starting = false
         state = .ready
         overlay.isHidden = true
+        logShown = false
+        logPanel.isHidden = true
+        logHeight.constant = 0
+        refreshLogButton()
         spinner.stopAnimation(nil)
         setStatus(.ready, text: "服务运行中 · http://127.0.0.1:\(server.port)")
         loadWeb()
@@ -777,7 +807,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         starting = false
         state = .ready
         overlay.isHidden = true
+        logShown = false
+        logPanel.isHidden = true
+        logHeight.constant = 0
+        refreshLogButton()
         spinner.stopAnimation(nil)
+        server.log.append("提示：当前连接的是外部启动的服务（非本 App 托管），因此没有进程日志。如需查看日志，请通过「服务器 → 重新启动服务」让本 App 接管服务进程。\n")
         setStatus(.ready, text: "已连接运行中的服务 · http://127.0.0.1:\(server.port)")
         loadWeb()
     }
@@ -866,13 +901,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc private func toggleLog() {
         logShown.toggle()
-        logScroll.isHidden = !logShown
+        refreshLogButton()
+        if logShown { logPanel.isHidden = false }
+        logHeight.constant = logShown ? logDockHeight : 0
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.2
+            window.contentView?.layoutSubtreeIfNeeded()
+        }, completionHandler: { [weak self] in
+            if let self, !self.logShown { self.logPanel.isHidden = true }
+        })
     }
 
-    @objc private func copyURL() {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(server.serverURL.absoluteString, forType: .string)
+    /// 同步日志按钮外观：抽屉展开时用系统强调色 + 实心图标高亮
+    private func refreshLogButton() {
+        logButton.image = NSImage(systemSymbolName: logShown ? "terminal.fill" : "terminal",
+                                  accessibilityDescription: "日志")
+        logButton.contentTintColor = logShown ? .controlAccentColor : .secondaryLabelColor
     }
 
     @objc private func toggleKeepOnQuit() {
@@ -945,11 +989,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // MARK: NSToolbarDelegate
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.reloadID, .browserID, .restartID, .logID, .urlID, .flexibleSpace]
+        [.reloadID, .browserID, .restartID, .flexibleSpace]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.reloadID, .browserID, .restartID, .flexibleSpace, .logID, .urlID]
+        [.flexibleSpace, .reloadID, .browserID, .restartID]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
@@ -969,18 +1013,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         case .restartID:
             item.label = "重启服务"
             item.toolTip = "重新启动服务 (⇧⌘R)"
-            item.image = NSImage(systemSymbolName: "arrow.counterclockwise.circle", accessibilityDescription: "重新启动服务")
+            item.image = NSImage(systemSymbolName: "power", accessibilityDescription: "重新启动服务")
             item.action = #selector(restartServer)
-        case .logID:
-            item.label = "日志"
-            item.toolTip = "显示或隐藏日志 (⌘L)"
-            item.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "显示或隐藏日志")
-            item.action = #selector(toggleLog)
-        case .urlID:
-            item.label = "复制地址"
-            item.toolTip = "复制服务地址"
-            item.image = NSImage(systemSymbolName: "link", accessibilityDescription: "复制服务地址")
-            item.action = #selector(copyURL)
         default:
             return nil
         }
