@@ -94,6 +94,7 @@ DSH/
 - **提示「端口被其他程序占用」**：菜单「服务器 → 端口设置…」换端口。
 - **登录时自动启动失败**：需要把 App 移到 /Applications 目录。
 - **窗口关闭 = 退出 App**：会连带停止服务（除非勾选「退出时保留服务进程」）。
+- **下载的 Release 提示「无法验证开发者」**：App 为 ad-hoc 签名，首次打开请右键 → 打开，或执行 `xattr -dr com.apple.quarantine /Applications/DSH.app`。
 
 ## 环境要求
 
