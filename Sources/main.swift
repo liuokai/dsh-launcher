@@ -151,6 +151,106 @@ final class ServerManager {
         return nil
     }
 
+    // MARK: 版本管理
+
+    /// npx 缓存中已安装的 dsh 信息
+    struct CachedDsh { let version: String; let binPath: String }
+
+    /// 扫描 ~/.npm/_npx 下已安装的所有 dsh 版本，返回最高版本。
+    /// 这是「只调起当前版本」的依据：启动时直接执行本地已装的二进制，不联网、不解析 latest。
+    func cachedDsh() -> CachedDsh? {
+        let fm = FileManager.default
+        let npxRoot = NSHomeDirectory() + "/.npm/_npx"
+        guard let dirs = try? fm.contentsOfDirectory(atPath: npxRoot) else { return nil }
+        var best: CachedDsh?
+        for d in dirs {
+            let base = npxRoot + "/" + d + "/node_modules"
+            let bin = base + "/.bin/dsh"
+            let pj = base + "/@deepseek-ai/dsh/package.json"
+            guard fm.isExecutableFile(atPath: bin),
+                  let data = fm.contents(atPath: pj),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let v = obj["version"] as? String else { continue }
+            if best == nil || Self.compareVersions(v, best!.version) > 0 {
+                best = CachedDsh(version: v, binPath: bin)
+            }
+        }
+        return best
+    }
+
+    /// semver 比较（支持 -rc.N 等预发布后缀）
+    static func compareVersions(_ a: String, _ b: String) -> Int {
+        func split(_ v: String) -> ([Int], String) {
+            let parts = v.split(separator: "-", maxSplits: 1).map(String.init)
+            let nums = parts[0].split(separator: ".").compactMap { Int($0) }
+            return (nums, parts.count > 1 ? parts[1] : "")
+        }
+        let (an, apre) = split(a)
+        let (bn, bpre) = split(b)
+        for i in 0..<max(an.count, bn.count) {
+            let x = i < an.count ? an[i] : 0
+            let y = i < bn.count ? bn[i] : 0
+            if x != y { return x < y ? -1 : 1 }
+        }
+        // 基础版本相同：无预发布后缀视为更高（正式版 > 预发布）
+        if apre.isEmpty && !bpre.isEmpty { return 1 }
+        if !apre.isEmpty && bpre.isEmpty { return -1 }
+        // 预发布后缀按「前缀 + 末尾数字」比较：rc.7 > rc.6
+        func rank(_ s: String) -> (String, Int) {
+            let comps = s.split(separator: ".").map(String.init)
+            if comps.count > 1, let last = comps.last, let n = Int(last) {
+                return (comps.dropLast().joined(separator: "."), n)
+            }
+            return (s, -1)
+        }
+        let (ak, an2) = rank(apre)
+        let (bk, bn2) = rank(bpre)
+        if ak != bk { return ak < bk ? -1 : 1 }
+        if an2 != bn2 { return an2 < bn2 ? -1 : 1 }
+        return 0
+    }
+
+    /// 查询 npm registry 上的最新版本（主线程回调；网络失败返回 nil）
+    func fetchLatestVersion(completion: @escaping (String?) -> Void) {
+        let url = URL(string: "https://registry.npmjs.org/@deepseek-ai/dsh/latest")!
+        let req = URLRequest(url: url, timeoutInterval: 8)
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            var result: String?
+            if let data,
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                result = obj["version"] as? String
+            }
+            DispatchQueue.main.async { completion(result) }
+        }.resume()
+    }
+
+    /// 运行一次性 npx 命令（用于手动升级下载新版本），输出进日志，主线程回调退出结果
+    func runTool(npx: String, args: [String], completion: @escaping (Bool) -> Void) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: npx)
+        p.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        let home = homeOverride ?? NSHomeDirectory()
+        env["HOME"] = home
+        if let lp = loginShellPath() { env["PATH"] = lp }
+        p.environment = env
+        p.currentDirectoryURL = URL(fileURLWithPath: home)
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            if let s = String(data: d, encoding: .utf8) { self?.log.append(s) }
+        }
+        p.terminationHandler = { proc in
+            DispatchQueue.main.async { completion(proc.terminationStatus == 0) }
+        }
+        do { try p.run() } catch { return false }
+        log.append("$ \(npx) \(args.joined(separator: " "))\n")
+        return true
+    }
+
     // MARK: 端口探测
 
     enum ProbeResult { case unreachable, dshRunning, otherServer }
@@ -177,15 +277,37 @@ final class ServerManager {
 
     // MARK: 启动 / 停止
 
-    /// 启动 `npx --yes @deepseek-ai/dsh web --port <port>` 服务进程（同步返回）
-    func spawn(npx: String, port: Int) -> Result<Void, LaunchError> {
+    /// 本次启动使用的 dsh 版本（nil = 本地未安装、正在首次下载）
+    private(set) var spawnedVersion: String?
+
+    /// 启动 `dsh web --port <port>` 服务进程（同步返回）。
+    /// 优先直接执行本地已安装的最高版本（零联网、不解析 latest、绝不自动升级）；
+    /// 仅当本地没有任何已装版本时（首次安装），才回退到 npx 下载最新版。
+    func spawn(port: Int) -> Result<Void, LaunchError> {
         if let p = process, p.isRunning { return .success(()) }
+        spawnedVersion = nil
+
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: npx)
-        var args = ["--yes", "@deepseek-ai/dsh", "web", "--port", String(port)]
+        let execPath: String
+        var args: [String]
+
+        if let cached = cachedDsh() {
+            // 本地已有安装版本：直接调起，不做任何版本解析
+            execPath = cached.binPath
+            args = ["web", "--port", String(port)]
+            spawnedVersion = cached.version
+            log.append("使用本地已装 dsh \(cached.version)（不会自动升级；如需新版请用「服务器 → 检查更新…」）\n")
+        } else if let npx = resolveNpx() {
+            execPath = npx
+            args = ["--yes", "@deepseek-ai/dsh", "web", "--port", String(port)]
+            log.append("本地未发现 dsh，首次运行需下载最新版本（可能需要几分钟）…\n")
+        } else {
+            return .failure(LaunchError(message: "未找到 dsh 或 npx。请先安装 Node.js（推荐 brew install node），然后重新启动本 App。"))
+        }
         if let extra = UserDefaults.standard.string(forKey: "extraArgs"), !extra.isEmpty {
             args.append(contentsOf: extra.split(separator: " ").map(String.init))
         }
+        p.executableURL = URL(fileURLWithPath: execPath)
         p.arguments = args
         var env = ProcessInfo.processInfo.environment
         let home = homeOverride ?? NSHomeDirectory()
@@ -213,7 +335,7 @@ final class ServerManager {
         }
         process = p
         ownsProcess = true
-        log.append("$ \(npx) \(args.joined(separator: " "))\n")
+        log.append("$ \(execPath) \(args.joined(separator: " "))\n")
         return .success(())
     }
 
@@ -243,7 +365,7 @@ final class ServerManager {
         }
     }
 
-    /// 停止服务进程（SIGTERM，2.5s 后 SIGKILL）
+    /// 停止服务进程（SIGTERM，2.5s 后 SIGKILL），并清理仍占用端口的残留进程
     func stopServer() {
         guard let p = process, p.isRunning else {
             process = nil
@@ -258,6 +380,19 @@ final class ServerManager {
         if p.isRunning { kill(p.processIdentifier, SIGKILL) }
         process = nil
         ownsProcess = false
+        killPortListener(port)
+    }
+
+    /// 兜底清理：杀掉仍在监听目标端口的进程。
+    /// 场景：通过 npm/npx 启动时，杀父进程（npm）后 node 子进程可能存活并继续占用端口。
+    private func killPortListener(_ port: Int) {
+        guard let out = runCapture("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"], timeout: 5)
+        else { return }
+        for line in out.split(separator: "\n") {
+            if let pid = pid_t(line.trimmingCharacters(in: .whitespaces)), pid > 1, pid != getpid() {
+                kill(pid, SIGTERM)
+            }
+        }
     }
 }
 
@@ -330,6 +465,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var restartServerItem: NSMenuItem?
     private var keepOnQuitItem: NSMenuItem?
     private var loginItem: NSMenuItem?
+    private var updateCheckItem: NSMenuItem?
+    private var upgrading = false
+    private var updateChecked = false
 
     // MARK: 生命周期
 
@@ -407,6 +545,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         keepOnQuitItem?.state = server.keepServerOnQuit ? .on : .off
         serverMenu.addItem(withTitle: "端口设置…", action: #selector(portSettings), keyEquivalent: "")
             .target = self
+        updateCheckItem = serverMenu.addItem(withTitle: "检查更新…", action: #selector(checkForUpdates), keyEquivalent: "")
+        updateCheckItem?.target = self
         if #available(macOS 13.0, *) {
             loginItem = serverMenu.addItem(withTitle: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
             loginItem?.target = self
@@ -755,34 +895,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private func spawnServer() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            guard let npx = self.server.resolveNpx() else {
-                DispatchQueue.main.async {
-                    self.fail("未找到 npx。请先安装 Node.js（推荐 brew install node），然后重新启动本 App。")
-                }
-                return
-            }
-            self.server.log.append("使用 npx：\(npx)\n")
             let port = self.server.port
-            let result = self.server.spawn(npx: npx, port: port)
+            let result = self.server.spawn(port: port)
             DispatchQueue.main.async {
                 switch result {
                 case .failure(let err):
                     self.fail(err.message)
                 case .success:
                     self.state = .connecting
+                    let freshDownload = self.server.spawnedVersion == nil
                     self.messageLabel.stringValue = "服务进程已启动，正在等待就绪…"
-                    self.detailLabel.stringValue = "首次运行可能需要下载 dsh 包，请稍候。"
+                    self.detailLabel.stringValue = freshDownload
+                        ? "首次运行需下载依赖，可能需要几分钟，进度见日志面板。"
+                        : "正在启动本地已装版本，通常几秒内完成。"
                     self.setStatus(.connecting, text: "正在连接 http://127.0.0.1:\(port) …")
-                    self.server.waitUntilReady(port: port, timeout: 150,
+                    // 首次下载依赖放宽超时；本地已装版本秒级启动，150s 足够
+                    self.server.waitUntilReady(port: port, timeout: freshDownload ? 600 : 150,
                         progress: { sec in
                             DispatchQueue.main.async {
-                                self.detailLabel.stringValue = "等待服务就绪… \(sec)s"
+                                self.detailLabel.stringValue = freshDownload
+                                    ? "正在下载依赖并等待服务就绪… \(sec)s"
+                                    : "等待服务就绪… \(sec)s"
                             }
                         },
                         completion: { ready in
                             DispatchQueue.main.async {
                                 if ready { self.attachStarted() }
-                                else { self.fail("服务启动失败或超时，请点击「日志」查看详情。") }
+                                else { self.fail("服务启动失败或超时，请点「日志」查看详情。若正在首次下载依赖，请等待下载完成后再次点击「重新启动服务」。") }
                             }
                         })
                 }
@@ -799,7 +938,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         logHeight.constant = 0
         refreshLogButton()
         spinner.stopAnimation(nil)
-        setStatus(.ready, text: "服务运行中 · http://127.0.0.1:\(server.port)")
+        let ver = server.spawnedVersion ?? server.cachedDsh()?.version
+        let suffix = ver.map { " · dsh \($0)" } ?? ""
+        setStatus(.ready, text: "服务运行中 · http://127.0.0.1:\(server.port)\(suffix)")
+        backgroundUpdateCheck()
         loadWeb()
     }
 
@@ -814,6 +956,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         spinner.stopAnimation(nil)
         server.log.append("提示：当前连接的是外部启动的服务（非本 App 托管），因此没有进程日志。如需查看日志，请通过「服务器 → 重新启动服务」让本 App 接管服务进程。\n")
         setStatus(.ready, text: "已连接运行中的服务 · http://127.0.0.1:\(server.port)")
+        backgroundUpdateCheck()
         loadWeb()
     }
 
@@ -892,10 +1035,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func restartServer() {
-        guard !starting else { return }
-        starting = true
+        guard !starting, !upgrading else { return }
         webView.stopLoading()
         server.stopServer()
+        // 注意：不要在这里设置 starting —— startPipeline() 内部会设置；
+        // 此前在此处先置 true 导致 startPipeline 的 guard 直接返回，重启静默失效
         startPipeline()
     }
 
@@ -970,6 +1114,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    // MARK: 更新检查与手动升级（绝不自动升级）
+
+    private func showAlert(_ title: String, _ info: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = info
+        a.runModal()
+    }
+
+    @objc private func checkForUpdates() {
+        guard !upgrading else { return }
+        updateCheckItem?.isEnabled = false
+        let current = server.cachedDsh()?.version
+        server.fetchLatestVersion { [weak self] latest in
+            guard let self else { return }
+            self.updateCheckItem?.isEnabled = true
+            guard let latest else {
+                self.showAlert("检查更新失败", "无法访问 npm 仓库（registry.npmjs.org），请检查网络连接后重试。")
+                return
+            }
+            if let current, ServerManager.compareVersions(latest, current) <= 0 {
+                self.updateCheckItem?.title = "检查更新…"
+                self.showAlert("已是最新版本", "本地版本 \(current) 已是 npm 上的最新版本（latest: \(latest)）。")
+                return
+            }
+            let a = NSAlert()
+            a.messageText = "发现新版本：\(latest)"
+            a.informativeText = "本地版本：\(current ?? "未安装")\n\n升级将在后台下载新版本（视网络情况约需一两分钟，进度可在日志面板查看），下载完成后自动重启服务生效。\n\n本 App 绝不会自动升级，升级只在你手动确认后进行。"
+            a.addButton(withTitle: "立即升级")
+            a.addButton(withTitle: "暂不升级")
+            if a.runModal() == .alertFirstButtonReturn {
+                self.performUpgrade(to: latest)
+            } else {
+                self.updateCheckItem?.title = "检查更新…（有新版本 \(latest)）"
+            }
+        }
+    }
+
+    private func performUpgrade(to version: String) {
+        guard let npx = server.resolveNpx() else {
+            showAlert("无法升级", "未找到 npx，请先安装 Node.js（推荐 brew install node）。")
+            return
+        }
+        upgrading = true
+        updateCheckItem?.title = "正在下载 \(version)…"
+        updateCheckItem?.isEnabled = false
+        // 展开日志抽屉展示下载进度
+        logShown = true
+        logPanel.isHidden = false
+        logHeight.constant = logDockHeight
+        refreshLogButton()
+        server.log.append("\n—— 手动升级：下载 dsh \(version) ——\n")
+        let started = server.runTool(npx: npx, args: ["--yes", "@deepseek-ai/dsh@" + version, "-V"]) { [weak self] ok in
+            guard let self else { return }
+            self.upgrading = false
+            self.updateCheckItem?.isEnabled = true
+            self.updateCheckItem?.title = "检查更新…"
+            if ok {
+                self.server.log.append("下载完成，正在重启服务以应用 \(version)…\n")
+                self.restartServer()
+            } else {
+                self.showAlert("升级失败", "下载或安装新版本时出错，详见日志面板。将继续使用当前版本。")
+            }
+        }
+        if !started {
+            upgrading = false
+            updateCheckItem?.isEnabled = true
+            updateCheckItem?.title = "检查更新…"
+            showAlert("升级失败", "无法启动下载进程，请检查 Node.js 环境。")
+        }
+    }
+
+    /// 服务就绪后的后台版本检测：只比对版本号、标注菜单标题，绝不下载或切换版本
+    private func backgroundUpdateCheck() {
+        guard !updateChecked else { return }
+        updateChecked = true
+        let current = server.cachedDsh()?.version
+        server.fetchLatestVersion { [weak self] latest in
+            guard let self, let latest else { return }
+            if current == nil || ServerManager.compareVersions(latest, current!) > 0 {
+                self.updateCheckItem?.title = "检查更新…（有新版本 \(latest)）"
+            }
+        }
+    }
+
     // MARK: NSWindowDelegate
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -1040,6 +1269,9 @@ func runSelfTest() -> Never {
         exit(1)
     }
     print("SELFTEST npx=\(npx)")
+    if let cached = sm.cachedDsh() {
+        print("SELFTEST cached-dsh=\(cached.version) bin=\(cached.binPath)")
+    }
 
     var probeResult: ServerManager.ProbeResult = .unreachable
     let sem0 = DispatchSemaphore(value: 0)
@@ -1062,7 +1294,7 @@ func runSelfTest() -> Never {
     sm.homeOverride = tmp
     defer { sm.homeOverride = nil }
 
-    switch sm.spawn(npx: npx, port: port) {
+    switch sm.spawn(port: port) {
     case .failure(let e):
         print("SELFTEST FAIL: spawn failed: \(e)")
         exit(1)

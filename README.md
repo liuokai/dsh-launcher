@@ -44,15 +44,22 @@ git clone https://github.com/liuokai/dsh-launcher.git && cd dsh-launcher
 | 重启服务 | 右上角工具栏「重启服务」或 ⇧⌘R |
 | 显示/隐藏服务日志 | 右下角「日志」按钮或 ⌘L |
 | 修改端口 | 菜单「服务器 → 端口设置…」 |
+| 检查更新 / 手动升级 | 菜单「服务器 → 检查更新…」 |
 | 退出时保留服务 | 菜单「服务器 → 退出时保留服务进程」 |
 | 登录时自动启动 | 菜单「服务器 → 登录时自动启动」（需 App 位于 /Applications） |
 
 ## 工作原理
 
 1. 启动时探测 `http://127.0.0.1:<port>/`：若返回 DeepSeek Harness 页面（检测 `__DSH_BOOT__` 标记），直接内嵌连接。
-2. 否则定位 npx：Finder 启动的 App 环境 PATH 很干净，App 依次尝试 `zsh -l` / `zsh -i` / `bash -l` 的 `command -v npx`，再兜底常见安装路径（Homebrew、`.local/bin`、hermes、volta、fnm 等）。
-3. 以登录 shell 的 PATH 启动 `npx --yes @deepseek-ai/dsh web --port <port>`，轮询直到页面就绪（首次运行 npx 需下载 dsh 包）。
-4. 退出时若服务由本 App 启动，发送 SIGTERM（2.5s 后 SIGKILL 兜底）。
+2. 否则启动服务：**优先直接调起本地已安装的最高版本 dsh**（扫描 `~/.npm/_npx` 缓存），不再联网解析 latest；仅当本地没有任何已装版本时（首次安装），才回退到 `npx --yes @deepseek-ai/dsh` 下载最新版。
+3. 轮询直到页面就绪（本地已装版本超时 150 秒；首次下载放宽到 600 秒）。
+4. 退出时若服务由本 App 启动，发送 SIGTERM（2.5s 后 SIGKILL 兜底），并清理仍占用端口的残留子进程（杀 npm 父进程后 node 子进程可能存活）。
+
+## 版本与升级策略
+
+- **只调起当前版本**：每次打开直接执行本地已装的 dsh，启动不联网、不会因上游发新版而被拖慢或改变行为。
+- **自动检测**：服务就绪后在后台比对 npm registry 最新版本，若有新版只在菜单「检查更新…」上标注提示，不下载、不切换。
+- **仅手动升级**：点击「检查更新…」并确认后，才下载新版本到本地缓存，完成后自动重启服务生效。**本 App 绝不自动升级。**
 
 ## 高级配置
 
